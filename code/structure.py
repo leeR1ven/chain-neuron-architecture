@@ -11,15 +11,12 @@
      给这一层的前额叶组 +1 个接收神经元（前额叶是落点，不是候选层）。
      加完**不重标定整网**（实测重标会把提升洗掉：L3 0.192→0.178，重标后 0.203）。
      实测：中等规模 L2 0.566 / L3 0.543 / L4 0.532 / L5 0.511——越深越好。
-  2. **减神经元**：只删两类——
-       跨输入几乎不激活的（没用），
-       跨输入始终同一读数的（常亮/常灭，不带特征）。
-     删完把它带死的 hop / 前额叶神经元级联删掉。
-  3. **常亮不送前额叶**：用一批随机输入看**跨输入的起伏**（不是时间上的变化）。
-     只筛"平均 > 0.5、std≈0"的常亮来源，把它进 hop / 前额叶的边去掉；
-     常灭的不在这里砍（参考输入不足时会误伤，完整规模实测过）。
-  4. 每次结构改动后重新标定门槛（步数必须和初始一致，28 步会把深层相似度带偏），
-     再复测前额叶四区相似度；定点改动只看目标区变好、别区不显著变差，否则回滚。
+  2. **减神经元/筛常亮**：只对"最新网络"的区做（默认 `gate_regions=("vision",)`）。
+     听觉/触觉/平衡的专用网络还没做出来（现在是旧的），大量细胞在参考输入下静默，
+     如果按"静默就删"会把旧网络连带打塌；所以这三个区先不动结构。
+     筛常亮只筛"平均 > 0.5、std≈0"的来源（常灭的走删除，不在这里砍）。
+  3. **加神经元后不重标定**：只给新神经元/新接收端设门槛。实测整体重标会把增益洗掉
+     （L3 0.192→0.178，重标后 0.203）；加完直接复测四区相似度，按前额叶组保护（任一组掉 >0.02 就回滚）。
 
 用法：
     python structure.py            # 中等规模演示（几分钟）
@@ -249,9 +246,15 @@ def _cascade_empty(B, rounds: int = 4):
     return removed
 
 
+def _region_of(region_name: str) -> str:
+    """wire_audio_L5_0 / pfc_audio_L5 / hop_audio_L5_0 / ret_audio_L5_0 -> audio"""
+    parts = region_name.split("_")
+    return parts[1] if len(parts) > 1 else ""
+
+
 def prune_constant_pfc(B, acts, feat_thr: float = FEAT_THR,
                        group: int = GROUP_PFC_FWD, always_on: bool = True,
-                       cascade: bool = False) -> dict:
+                       cascade: bool = False, regions=None) -> dict:
     """常亮（默认只筛"总是亮"）的神经元不往前额叶送：删掉它进入 hop / 前额叶的边。
 
     只筛"总是亮"是因为：常灭的神经元确实没用，但**参考输入太少时**，
@@ -267,6 +270,9 @@ def prune_constant_pfc(B, acts, feat_thr: float = FEAT_THR,
         weak = weak & (mean > 0.5)
     m = B.group == group
     drop = m & weak[B.src]
+    if regions is not None:
+        dst_reg = np.array([_region_of(B.region[int(d)]) for d in B.dst])
+        drop = drop & np.isin(dst_reg, list(regions))
     n_drop = int(drop.sum())
     w_drop = float(B.w[drop].sum()) if n_drop else 0.0
     if n_drop:
@@ -280,13 +286,16 @@ def prune_constant_pfc(B, acts, feat_thr: float = FEAT_THR,
 
 
 def prune_useless(B, ids: dict, acts, mean_thr: float = SILENT,
-                  std_thr: float = CONST_STD) -> dict:
+                  std_thr: float = CONST_STD, cascade: bool = True,
+                  regions=None) -> dict:
     """只删各区第 2~4 层里：从不用（平均≈0）与常亮/常灭（跨输入 std≈0）的神经元。"""
     mean = acts.mean(axis=0)
     std = acts.std(axis=0)
     silent, constant = [], []
     for (region, depth), lay in ids["layers"].items():
         if depth < 2:
+            continue
+        if regions is not None and region not in regions:
             continue
         lay = lay[B.alive[lay]]
         if len(lay) == 0:
@@ -295,9 +304,9 @@ def prune_useless(B, ids: dict, acts, mean_thr: float = SILENT,
         constant += list(lay[(std[lay] < std_thr) & (mean[lay] >= mean_thr)])
     uniq = np.unique(np.r_[silent, constant]).astype(int)
     n = B.remove(uniq) if len(uniq) else 0
-    cascade = _cascade_empty(B)
+    dead = _cascade_empty(B) if cascade else []
     return {"silent": len(silent), "constant": len(constant),
-            "removed": n, "cascade_removed": len(cascade)}
+            "removed": n, "cascade_removed": len(dead)}
 
 
 # ------------------------------------------------------------------ 加
@@ -367,29 +376,34 @@ def grow_layer(B, ids: dict, acts, sp, geo: Geometry, region: str, depth: int,
                                 rng.uniform(0.06, 0.16, len(tg)))
             # 专用线：子单元 → 两个中继 → 这一层的前额叶组
             prev = np.asarray([child], dtype=int)
+            wlist = []
             for hj, frac in enumerate((1 / 3, 2 / 3)):
                 xh = x0 + (geo.x_pfc - x0) * frac
                 hp = np.array([[xh, pos[1], pos[2]]], dtype=np.float32)
-                wnode = B.add(f"wire_{region}_L{depth}_g{hj}", hp, thr=0.0, soft=1.0)
-                B.link(prev, wnode, w_range=(1.0, 1.0), group=GROUP_PFC_FWD)
+                wnode = int(B.add(f"wire_{region}_L{depth}_g{hj}", hp,
+                                  thr=0.0, soft=1.0)[0])
+                B.link(prev, np.asarray([wnode]), w_range=(1.0, 1.0),
+                       group=GROUP_PFC_FWD)
                 hops[hj] = np.r_[hops[hj], wnode]
-                prev = wnode
+                wlist.append(wnode)
+                prev = np.asarray([wnode])
             g = g_pfc[B.alive[g_pfc]]
-            if len(g):
-                B.connect(g, prev, k=3, w_range=(0.06, 0.16), axes=(1, 2),
-                          group=GROUP_PFC_FWD,
-                          exact=(sp.pick_mode == "exact"))
+            # 注意：**不要**把新线接到所有已有的前额叶神经元上——那会给每个老神经元
+            # 每个子单元加 3 条边（32 个子单元 = 96 条），一下把它们全推到饱和。
+            # 新信号的落点是下面新加的那个接收神经元。
             # 前额叶接收端也按比例 +1：链的终点跟着扩容（相当于立体网络加完神经元要扩 top-k），
-            # 它不是"另一层"，是这一层信号的落点
+            # 它不是"另一层"，是这一层信号的落点；输入就接这条子单元自己的两根中继。
             gp = ids["pfc_groups"][(region, depth)]
-            src_h = hops[1][B.alive[hops[1]]]
-            if len(src_h):
+            if len(wlist):
                 pfc_pos = np.array([[geo.x_pfc, pos[1], pos[2]]], dtype=np.float32)
                 pc = int(B.add(f"pfc_{region}_L{depth}", pfc_pos,
-                               thr=0.30, soft=0.35)[0])
-                B.connect([pc], src_h, k=2, w_range=(0.06, 0.16), axes=(1, 2),
-                          thr_frac=f2, soft_frac=g2, group=GROUP_PFC_FWD,
-                          exact=(sp.pick_mode == "exact"))
+                               thr=0.0, soft=1.0)[0])
+                B.connect([pc], np.asarray(wlist), k=len(wlist),
+                          w_range=(0.6, 0.6), axes=(1, 2),
+                          group=GROUP_PFC_FWD, exact=(sp.pick_mode == "exact"))
+                # 新接收端按上游实际活动量级定门槛：thr=0、带宽=2×入边和（原样收，不压死）
+                B.thr[pc] = 0.0
+                B.soft[pc] = max(1e-4, 2.0 * 0.6 * len(wlist))
                 ids["pfc_groups"][(region, depth)] = np.r_[gp, pc]
                 _rebuild_pfc_index(ids)
             new_ids.append(child)
@@ -477,6 +491,7 @@ def _mean_sim(sims: dict) -> float:
 def evolve(B, ids, ui, sp, geo: Geometry, rounds: int = 3, grow_frac: float = 0.10,
            grow_target: str = "auto", per_region: int = 5, feature_n: int = 8,
            steps: int = PROBE_STEPS, post_passes: int = 2, post_steps: int = 40,
+           gate_regions: tuple = ("vision",),
            seed: int = 0, verbose: bool = True):
     """先筛常亮，再按"最难分的那一区"逐轮加神经元；变差回滚。"""
     probes = make_change_probes(sp, per_region=per_region, seed=seed)
@@ -495,22 +510,34 @@ def evolve(B, ids, ui, sp, geo: Geometry, rounds: int = 3, grow_frac: float = 0.
                         for k, v in sims0.items()}
     sims = sims0
 
-    # ①② 常亮不送额叶 + 减静默/常亮神经元：一起改，复测四区相似度；整体变差就整块回滚
+    # ①② 常亮不送额叶 + 减静默/常亮神经元：**不重标定**，改完直接看每一层前额叶组有没有掉。
+    # 只对"最新网络"的区做筛/删（默认视觉）；听觉/触觉/平衡的专用网络还没做出来，先不动结构，
+    # 否则旧网络里大量静默细胞会被当成"没用"删掉、连带把它们的额叶组打塌。
+    s_g0 = {r: region_group_sims(B, acts_ch, ids, probes, r) for r in REGIONS}
     snapB, snapIds = copy.deepcopy(B), copy.deepcopy(ids)
-    st_gate = prune_constant_pfc(B, acts_all)
-    st_prune = prune_useless(B, ids, acts_all)
+    st_gate = prune_constant_pfc(B, acts_all, regions=gate_regions)
+    st_prune = prune_useless(B, ids, acts_all, regions=gate_regions)
     if any(st_gate.values()) or any(st_prune.values()):
-        ref_calibrate(B, ids, ui, passes=post_passes, steps=post_steps)
         acts_ch = observe(B, ui, probes, steps)
         acts_rand = observe(B, ui, rand, steps)
         sims1 = all_similarities(B, acts_ch, ids, probes)
+        s_g1 = {r: region_group_sims(B, acts_ch, ids, probes, r) for r in REGIONS}
+        drops = []
+        for r in REGIONS:
+            for d, v0 in s_g0[r].items():
+                v1 = s_g1[r].get(d, np.nan)
+                if not np.isfinite(v0):
+                    continue
+                drops.append((v1 - v0) if np.isfinite(v1) else -9.0)
+        worst = min(drops) if drops else 0.0
     else:
         sims1 = sims0
-    if _mean_sim(sims1) > _mean_sim(sims0) + 0.01:
+        worst = 0.0
+    if worst < -0.02 or _mean_sim(sims1) > _mean_sim(sims0) + 0.02:
         B, ids, ui = snapB, snapIds, Interface(snapB, snapIds, sp)
         report["structure_skipped"] = True
         if verbose:
-            print("①② 常亮筛选 + 减神经元：四区整体变差，已回滚（不动结构）")
+            print(f"①② 常亮筛选 + 减神经元：有一组前额叶掉 {worst:.3f}，已回滚")
     else:
         sims = sims1
         report["gate"], report["prune"] = st_gate, st_prune
@@ -575,8 +602,13 @@ def evolve(B, ids, ui, sp, geo: Geometry, rounds: int = 3, grow_frac: float = 0.
             # 防"总码变好、某一层的前额叶组塌掉"：逐组比较，最差的那组不许掉超过 0.02
             acts_b = observe(B, ui, probes, steps)
             s_after_g = region_group_sims(B, acts_b, ids, probes, region)
-            worst_group = min((s_after_g.get(d, 0.0) - s_before_g.get(d, 0.0))
-                              for d in s_before_g)
+            drops = []
+            for d, v0 in s_before_g.items():
+                v1 = s_after_g.get(d, np.nan)
+                if not np.isfinite(v0):
+                    continue
+                drops.append((v1 - v0) if np.isfinite(v1) else -9.0)
+            worst_group = min(drops) if drops else 0.0
             delta = (sims_all.get(region, np.nan) - sims_new_all.get(region, np.nan))
             others = [sims_new_all[k] - sims_all[k] for k in sims_all
                       if k != region and np.isfinite(sims_all[k])

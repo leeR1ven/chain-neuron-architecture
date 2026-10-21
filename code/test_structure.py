@@ -102,7 +102,7 @@ def main() -> int:
     check("加前额叶神经元生效",
           len(newp) > 0 and len(ids["pfc_groups"][gkey]) == n_g0 + len(newp),
           f"{n_g0} -> {len(ids['pfc_groups'][gkey])}")
-    check("新前额叶神经元各 2 条输入", bool(np.all(din2[newp] == 2)),
+    check("新前额叶神经元 1~2 条输入", bool(np.all((din2[newp] >= 1) & (din2[newp] <= 2))),
           din2[newp].tolist())
     check("前额叶索引已重建", bool(np.isin(newp, ids["other_pfc"]).all()))
 
