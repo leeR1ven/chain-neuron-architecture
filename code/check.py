@@ -164,6 +164,61 @@ def check_architecture(B, ids: dict, sp: Spec, geo: Geometry) -> dict:
                 issues.append(f"{r} 在 v={v} 时温度计不是每对恰好一个")
                 break
 
+    # 8) 区隔离与层序：只允许"上一层→下一层 / 输入→L1、L2 / 回程落回本层"
+    lay_depth = {}
+    for (r, d), arr in ids["layers"].items():
+        for i in np.asarray(arr).ravel():
+            lay_depth[int(i)] = (r, int(d))
+    input_cells = set()
+    for r in REGIONS:
+        for nm in ("pos", "neg"):
+            input_cells.update(int(i) for i in ids[nm][r].ravel())
+    bad_pfc_pfc = bad_cross = bad_skip = bad_l1 = bad_back = 0
+    skip_examples = []
+    for s, t, g in zip(B.src, B.dst, B.group):
+        s, t = int(s), int(t)
+        sr, st = B.region[s], B.region[t]
+        if st.startswith("pfc_") and sr.startswith("pfc_"):
+            bad_pfc_pfc += 1
+        if sr.startswith(("down", "force", "gate", "dis", "inh")) and t in lay_depth:
+            bad_back += 1
+        if t not in lay_depth:
+            continue
+        rt, dt = lay_depth[t]
+        if dt == 1:
+            if s not in input_cells:
+                bad_l1 += 1
+            continue
+        if s in input_cells:
+            if dt != 2:
+                bad_skip += 1
+                if len(skip_examples) < 5:
+                    skip_examples.append(f"{sr}→{st}(g={int(g)})")
+            continue
+        if s in lay_depth:
+            rs, ds = lay_depth[s]
+            if rs != rt:
+                bad_cross += 1
+            elif ds != dt - 1:
+                bad_skip += 1
+                if len(skip_examples) < 5:
+                    skip_examples.append(f"{sr}→{st}(g={int(g)})")
+            continue
+        # 回程：ret_* → 本层（group19）
+        if int(g) == 19 and sr.startswith("ret_") and sr.split("_")[1] == rt:
+            continue
+        bad_skip += 1
+        if len(skip_examples) < 5:
+            skip_examples.append(f"{sr}→{st}(g={int(g)})")
+    for nm, v in (("额叶→额叶（内部不应互连）", bad_pfc_pfc),
+                  ("跨区边", bad_cross),
+                  ("跳层/非法前向边", bad_skip),
+                  ("非输入源驱动 L1", bad_l1),
+                  ("运动区→感觉区反向边", bad_back)):
+        if v:
+            extra = ("，例：" + "，".join(skip_examples)) if nm.startswith("跳层") else ""
+            issues.append(f"{nm}：{v} 条{extra}")
+
     stats.update({
         "neurons": int(n), "alive": int(alive.sum()), "edges": int(len(B.src)),
         "layers": last, "pfc_x": round(x_pfc, 3),

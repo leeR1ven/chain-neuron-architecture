@@ -352,6 +352,13 @@ def grow_layer(B, ids: dict, acts, sp, geo: Geometry, region: str, depth: int,
             continue
         order = np.argsort(-B.w[e])
         srcs, ws = B.src[e][order], B.w[e][order]
+        # 只复制**前向**输入：父神经元的入边里可能混着回程边（ret_*），
+        # 复制过去会把回程边变成 group0 的"前向边"，破坏架构（自检会抓到）。
+        keep_src = np.array([not B.region[int(s)].startswith(("ret_", "rt_inh_"))
+                             for s in srcs], dtype=bool)
+        srcs, ws = srcs[keep_src], ws[keep_src]
+        if len(srcs) == 0:
+            continue
         pos0 = B.xyz([pid])[0]
         for c in range(children):
             S, W = srcs[c * k_in:(c + 1) * k_in], ws[c * k_in:(c + 1) * k_in]
