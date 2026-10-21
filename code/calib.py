@@ -41,13 +41,14 @@ def _refs(ui):
     return out
 
 
-def ref_calibrate(B: Brain, ids: dict, ui, passes: int = 2, **kw) -> None:
+def ref_calibrate(B: Brain, ids: dict, ui, passes: int = 2, steps: int = 40, **kw) -> None:
     refs = _refs(ui)
     fwd = np.array([not B.region[int(x)].startswith("ret_") for x in B.src])
-    sw = np.bincount(B.dst[fwd], weights=B.w[fwd], minlength=B.n)
 
     groups: dict = {}
     for i in range(B.n):
+        if not B.alive[i]:
+            continue
         r = B.region[i]
         if r.startswith("ret_") or r.endswith(("_L1on", "_L1off")):
             continue
@@ -61,7 +62,7 @@ def ref_calibrate(B: Brain, ids: dict, ui, passes: int = 2, **kw) -> None:
             drv = []
             for ext in refs:
                 B.act[:] = 0.0
-                for _ in range(40):
+                for _ in range(steps):
                     B.step(external=ext)
                 drv.append(np.abs(np.bincount(B.dst, weights=B.sgn * B.w * B.act[B.src],
                                                minlength=B.n))[g])

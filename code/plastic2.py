@@ -35,6 +35,7 @@ class Plastic2:
         self.enabled = False
         self.edges: dict[tuple[int, int], float] = {}
         self.t = 0
+        self._cursor = 0        # inject 的轮转游标
 
     # ---------------------------------------------------------------- 一拍
     def tick(self, prev_act: np.ndarray, act: np.ndarray):
@@ -78,11 +79,23 @@ class Plastic2:
                     del self.edges[k]
 
     def inject(self, B):
-        """把可塑边并进引擎（不存在的加为新边，已有的同步权重）。"""
+        """把可塑边并进引擎（不存在的加为新边，已有的同步权重）。
+
+        注：用游标轮转，每拍只处理 max_new_per_tick 条但**不会永远只处理前 100 条**
+        （原来 list(edges)[:100] 会让第 100 条之后的边永远轮不到）。
+        """
         if not self.enabled or not self.edges:
             return 0
+        items = list(self.edges.items())
+        n = len(items)
+        start = self._cursor % n
+        take = min(self.cfg.max_new_per_tick, n)
+        batch = items[start:start + take]
+        if len(batch) < take:                      # 到尾部后从头上补
+            batch += items[:take - len(batch)]
+        self._cursor = (start + take) % n
         added = 0
-        for (i, j), w in list(self.edges.items())[: self.cfg.max_new_per_tick]:
+        for (i, j), w in batch:
             hit = np.nonzero((B.src == i) & (B.dst == j))[0]
             if len(hit):
                 B.w[hit[0]] = w

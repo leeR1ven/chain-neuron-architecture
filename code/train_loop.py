@@ -17,9 +17,9 @@ import copy
 import json
 import os
 import sys
+from dataclasses import replace
 
 import numpy as np
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from brain import Config  # noqa: E402
 from build import Interface, Spec, build  # noqa: E402
@@ -83,23 +83,39 @@ def evaluate(B, ids, sp, seed=0):
     return score / max(1, total)
 
 
+def mutate(base, rng):
+    """在最优者附近抖动出生参数（融合=直接继承，变异=小步抖动）。"""
+    k = int(np.clip(base.k_near + rng.integers(-2, 3), 4, 24))
+    ratio = tuple(float(np.clip(x * rng.uniform(0.85, 1.15), 0.5, 12.0))
+                  for x in base.layer_ratio)
+    return replace(base, k_near=k, layer_ratio=ratio)
+
+
+def run_one(sp, seed):
+    cfg = Config(seed=int(seed))
+    B, ids, sp, _ = build(sp, cfg, verbose=False)
+    return evaluate(B, ids, sp), sp, cfg.seed
+
+
 def main(gens=3, pop=4, keep=2):
     rng = np.random.default_rng(2024)
     best = None
     for gen in range(gens):
         rows = []
-        for i in range(pop):
-            sp = make_spec(rng)
-            cfg = Config(seed=int(rng.integers(1, 10 ** 6)))
-            B, ids, sp, _ = build(sp, cfg, verbose=False)
-            s = evaluate(B, ids, sp, seed=i)
-            rows.append((s, sp, cfg.seed))
+        if best is None:
+            for _ in range(pop):
+                rows.append(run_one(make_spec(rng), int(rng.integers(1, 10 ** 6))))
+        else:
+            # 上一代最优原样进下一代（精英保留），其余是它的变异体
+            rows.append((best[0], best[1], best[2]))
+            for _ in range(pop - 1):
+                sp = mutate(best[1], rng)
+                rows.append(run_one(sp, int(rng.integers(1, 10 ** 6))))
         rows.sort(key=lambda r: -r[0])
-        print(f"第 {gen+1} 代： " + "  ".join(f"{s:.3f}" for s, _, _ in rows))
-        best = rows[0]
-        # 融合 + 变异：以最优者为底，下一代在它附近抖动
-        sp_b, cfg_b = rows[0][1], rows[0][2]
-        rng = np.random.default_rng(cfg_b + gen)     # 用最优者的种子衍生下一代
+        if best is None or rows[0][0] > best[0]:
+            best = rows[0]
+        print(f"第 {gen+1} 代： " + "  ".join(f"{s:.3f}" for s, _, _ in rows)
+              + f"   当前最优 {best[0]:.3f}")
     print(f"\n最优：得分 {best[0]:.3f}  感受野 {best[1].k_near}  层比 {best[1].layer_ratio}")
     with open(os.path.join(HERE, "train_loop_result.json"), "w", encoding="utf-8") as f:
         json.dump({"best_score": best[0], "k_near": int(best[1].k_near),

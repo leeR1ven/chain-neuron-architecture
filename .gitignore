@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+
+# 运行产物（每次跑都会重新生成）
+code/results.json
+code/train_loop_result.json
+code/structure_result.json

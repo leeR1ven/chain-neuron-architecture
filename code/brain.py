@@ -42,8 +42,10 @@ class Brain:
         self.is_inh: list[bool] = []
         self.counted: list[bool] = []
         self.act = np.zeros(0, dtype=np.float32)
+        self.alive = np.zeros(0, dtype=bool)   # 结构可塑性：被删掉的神经元保留编号，但不再参与
         self.gain = 0.0
         self.n = 0
+        self._allp = np.zeros((0, 3), dtype=np.float32)
         # 连接
         self.src = np.zeros(0, dtype=np.int32)
         self.dst = np.zeros(0, dtype=np.int32)
@@ -64,8 +66,38 @@ class Brain:
         self.is_inh += [bool(inh)] * len(p)
         self.counted += [bool(counted)] * len(p)
         self.n += len(p)
-        self.act = np.zeros(self.n, dtype=np.float32)
+        # 追加而不是清零：结构可塑性会在运行中加神经元，已有活动不能被抹掉
+        act = np.zeros(self.n, dtype=np.float32)
+        act[:start] = self.act
+        self.act = act
+        self.alive = np.r_[self.alive, np.ones(len(p), dtype=bool)]
+        self._cache_n = -1
         return np.arange(start, start + len(p))
+
+    def remove(self, ids) -> int:
+        """标记删除（不改编号，保证 ids / 位置 / 统计仍然对得上）。
+
+        删除的神经元：活动清零、门槛与带宽置 0（永远不会再发），
+        与它相连的边整条去掉（不是权重置 0）——这样 step 的边数才是真实边数。
+        """
+        ids = np.asarray(ids, dtype=int).ravel()
+        ids = ids[self.alive[ids]]
+        if len(ids) == 0:
+            return 0
+        self.alive[ids] = False
+        self.act[ids] = 0.0
+        for i in ids:
+            self.thr[int(i)] = 0.0
+            self.soft[int(i)] = 1.0
+        drop = np.isin(self.src, ids) | np.isin(self.dst, ids)
+        if drop.any():
+            keep = ~drop
+            self.src = self.src[keep]
+            self.dst = self.dst[keep]
+            self.w = self.w[keep]
+            self.sgn = self.sgn[keep]
+            self.group = self.group[keep]
+        return int(len(ids))
 
     def xyz(self, ids) -> np.ndarray:
         if self._cache_n != self.n:
@@ -76,7 +108,8 @@ class Brain:
     # ---------------------------------------------------------------- 连
     def connect(self, targets, sources, k: int, w_range=(0.05, 0.20),
                 axes=(1, 2), bias: float = 3.0, group: int = 0,
-                thr_frac: float | None = None, soft_frac: float | None = None):
+                thr_frac: float | None = None, soft_frac: float | None = None,
+                nearest: bool = True, exact: bool = False):
         """出生连线：**随机连接更靠近自己的神经元**。
 
         targets 的每个神经元，从 sources 里按 axes 指定的平面距离取最近的
@@ -94,9 +127,19 @@ class Brain:
         pool = min(len(sources), max(k, int(k * bias)))
         S, D, W = [], [], []
         for t, q in zip(targets, tp):
-            d = np.linalg.norm(sp - q, axis=1)
-            cand = np.argpartition(d, min(pool, len(d) - 1))[:pool]
-            sel = self.rng.choice(cand, size=min(k, len(cand)), replace=False)
+            if nearest:
+                d = np.linalg.norm(sp - q, axis=1)
+                if exact:
+                    # 确定性：只取最近的 k 个，不在 3k 候选里随机挑
+                    # （随机挑会掺进相对远、关系不强的输入，等于把无关信号混进来）
+                    sel = np.argsort(d)[:k]
+                else:
+                    cand = np.argpartition(d, min(pool, len(d) - 1))[:pool]
+                    sel = self.rng.choice(cand, size=min(k, len(cand)), replace=False)
+            else:
+                # 对照实验用：不管位置，从整层里随机挑（模拟"无关信号被同一个链接受"）
+                cand = self.rng.choice(len(sources), size=pool, replace=False)
+                sel = self.rng.choice(cand, size=min(k, len(cand)), replace=False)
             for si in sel:
                 S.append(int(sources[si]))
                 D.append(int(t))
@@ -120,6 +163,27 @@ class Brain:
                     self.thr[int(t)] = thr_frac * s
                 if soft_frac is not None:
                     self.soft[int(t)] = max(1e-4, soft_frac * s)
+
+    def link(self, sources, targets, w_range=(1.0, 1.0), group: int = 0) -> np.ndarray:
+        """一对一专用线：第 i 个 source 只连第 i 个 target（长度必须相同）。
+
+        "一个链式神经元只接一个上游神经元"就用它；配合 thr=0、soft=w，
+        中继变成一根原样传信号的线（不混合、不丢细节）。
+        """
+        S = np.asarray(sources, dtype=np.int32).ravel()
+        D = np.asarray(targets, dtype=np.int32).ravel()
+        if len(S) != len(D):
+            raise ValueError(f"link 要求一一对应：{len(S)} 个来源 vs {len(D)} 个目标")
+        if len(S) == 0:
+            return np.zeros(0, dtype=np.float32)
+        W = self.rng.uniform(*w_range, size=len(S)).astype(np.float32)
+        sgn = np.where([self.is_inh[int(i)] for i in S], -1.0, 1.0).astype(np.float32)
+        self.src = np.r_[self.src, S]
+        self.dst = np.r_[self.dst, D]
+        self.w = np.r_[self.w, W]
+        self.sgn = np.r_[self.sgn, sgn]
+        self.group = np.r_[self.group, np.full(len(S), group, dtype=np.int16)]
+        return W
 
     def chain(self, relays, w_range=(0.35, 0.45), group: int = 0,
               thr_frac: float = 0.55, soft_frac: float = 0.45):
@@ -154,8 +218,14 @@ class Brain:
 
     # ---------------------------------------------------------------- 看
     def ids_of(self, prefix: str) -> np.ndarray:
-        return np.array([i for i in range(self.n) if self.region[i].startswith(prefix)],
+        """按区名前缀取编号；已删除的神经元默认不返回（避免统计把死细胞算进去）。"""
+        return np.array([i for i in range(self.n)
+                         if self.alive[i] and self.region[i].startswith(prefix)],
                         dtype=int)
+
+    @property
+    def n_alive(self) -> int:
+        return int(self.alive.sum())
 
     def n_active(self, prefix: str, t: float = 0.35) -> int:
         ids = self.ids_of(prefix)

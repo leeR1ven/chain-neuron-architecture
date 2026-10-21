@@ -83,14 +83,19 @@ for k in (1, 2, 3, 5, 7, 8, 10):
     print(f"   亮 {k:2d} 个 → 力度档 {lvl}/{sp.n_force}")
 
 print("\n③ 可塑连接自测")
-if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "plastic.py")):
+HERE = os.path.dirname(os.path.abspath(__file__))
+for _name in ("plastic2", "plastic"):
+    if not os.path.exists(os.path.join(HERE, _name + ".py")):
+        continue
     try:
-        mod = importlib.import_module("plastic")
+        mod = importlib.import_module(_name)
         if hasattr(mod, "self_test"):
+            print(f"   （{_name}.py）")
             mod.self_test()
         else:
-            print("   plastic.py 存在，但没有 self_test()；请单独跑它的测试脚本")
+            print(f"   {_name}.py 存在，但没有 self_test()；请单独跑它的测试脚本")
+        break
     except Exception as e:                                   # noqa: BLE001
         print(f"   调用失败：{e}")
 else:
-    print("   plastic.py 还没交回来")
+    print("   plastic2.py 还没交回来")

@@ -47,10 +47,20 @@ class Spec:
     layer_floor: tuple = (128, 192, 256)   # 各层神经元数下限（小模型可调小）
     pfc_ratio: float = 1.0       # 每一层各送多少比例的神经元到前额叶（加大以便承载细微差别）
     relay_gap: int = 0            # 链上每隔几个位置放一个（0=相邻）
+    chain_mode: str = "one2one"  # "one2one"=一条专用线只接一个神经元（默认）；"knn"=就近多输入；"random"=对照
+    layer_mode: str = "knn"      # 区内 L2–L4 的接线："knn" / "random"（后者只用于对照）
+    pick_mode: str = "random"    # 就近候选怎么挑："random"=旧的 3k 里随机；"exact"=只取最近 k 个
 
 
 # 按深度定门槛比例：每深一层活跃密度约减半，门槛比例必须跟着减半，否则下一级凑不满门槛
 DEPTH_FRAC = {1: (0.25, 0.45), 2: (0.25, 0.45), 3: (0.08, 0.30), 4: (0.04, 0.25)}
+
+# 出生连线最后统一按深度覆盖一次（与 build 末尾的 _DEPTH 一致；结构可塑性新增神经元也用它）
+DEPTH_GAIN = {1: (0.30, 0.90), 2: (0.26, 0.45), 3: (0.22, 0.32), 4: (0.22, 0.28)}
+
+# 边分组：所有"通往中继、进入前额叶"的边都打这个组号。
+# structure.py 靠它找出"往前额叶送"的通路，做"常亮不带特征"的筛选。
+GROUP_PFC_FWD = 30
 
 
 @dataclass
@@ -118,6 +128,7 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
         prev = np.r_[on, off]
         layers = [prev]
         ids[f"{name}_L1on"], ids[f"{name}_L1off"] = on, off
+        ids.setdefault("layers", {})[(name, 1)] = np.r_[on, off]
         xs = np.linspace(geo.x_in + 0.10, geo.x_pfc - 0.04, len(sp.layer_ratio) + 1)
         for li, ratio in enumerate(sp.layer_ratio):
             # 小感觉区（平衡只有 6 个通道）层内也要有下限，否则整区太小、送上去的图案分不开
@@ -127,6 +138,7 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
             zz = np.linspace(0.10, 0.90, cnt)
             p = np.stack([np.full(cnt, xs[li + 1]), yy, zz], axis=1).astype(np.float32)
             cur = B.add(f"{name}_L{li + 2}", p, thr=0.30, soft=0.40)
+            ids.setdefault("layers", {})[(name, li + 2)] = cur
             if li == 0:
                 # 只有这一跳分两条路：prev 的前半是"正"、后半是"反"
                 half = len(prev) // 2
@@ -138,16 +150,22 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
                 kk = max(8, min(sp.k_near, half // 2))
                 f, gg = DEPTH_FRAC.get(2, (0.25, 0.45))
                 B.connect(cur[0::2], prev[:half], k=kk, w_range=(0.06, 0.16),
-                          axes=(1, 2), thr_frac=f, soft_frac=gg)
+                          axes=(1, 2), thr_frac=f, soft_frac=gg,
+                          nearest=(sp.layer_mode != "random"),
+                          exact=(sp.pick_mode == "exact"))
                 B.connect(cur[1::2], prev[half:], k=kk, w_range=(0.06, 0.16),
-                          axes=(1, 2), thr_frac=f, soft_frac=gg)
+                          axes=(1, 2), thr_frac=f, soft_frac=gg,
+                          nearest=(sp.layer_mode != "random"),
+                          exact=(sp.pick_mode == "exact"))
             else:
                 # 更深的层**不再分路**：按索引对半切等于把这一层的空间范围砍一半，
                 # 上层每个神经元只能看到下一层一半的空间 → 活跃密度逐级减半 → 饿死
                 kk = max(3, min(sp.k_near, len(prev) // 8))
                 f, gg = DEPTH_FRAC.get(li + 2, (0.25, 0.45))
                 B.connect(cur, prev, k=kk, w_range=(0.06, 0.16), axes=(1, 2),
-                          thr_frac=f, soft_frac=gg)
+                          thr_frac=f, soft_frac=gg,
+                          nearest=(sp.layer_mode != "random"),
+                          exact=(sp.pick_mode == "exact"))
             prev = cur
             layers.append(cur)
             ids[f"{name}_L{li + 2}"] = cur
@@ -168,34 +186,56 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
             zz = np.linspace(0.10, 0.90, cnt)
             p = np.stack([np.full(cnt, geo.x_pfc), yy, zz], axis=1).astype(np.float32)
             g = B.add(f"pfc_{name}_L{li}", p, thr=0.30, soft=0.35)
+            ids.setdefault("pfc_groups", {})[(name, li)] = g
             # 这一层到前额叶之间，**每隔一小段放一级神经元**，一节一节往前送；
             # 越靠近前额叶这一级数量越多
             x0 = float(geo.x_in + 0.10)
             hops = []
+            one = sp.chain_mode == "one2one"
             for hj, frac in enumerate((1 / 3, 2 / 3)):
-                hc = max(2, int(round(cnt * (0.4 + 0.3 * hj))))
-                yh = np.linspace(y0, y1, hc)
-                zh = np.linspace(0.10, 0.90, hc)
                 xh = x0 + (geo.x_pfc - x0) * frac
-                hp = np.stack([np.full(hc, xh), yh, zh], axis=1).astype(np.float32)
-                h = B.add(f"hop_{name}_L{li}_{hj}", hp, thr=0.30, soft=0.35)
-                srch = lay if hj == 0 else hops[-1]
-                hf = len(srch) // 2
-                kh = max(3, min(32, hf // 8))
-                f, gg = DEPTH_FRAC.get(li, (0.25, 0.45))
-                B.connect(h[0::2], srch[:hf], k=kh, w_range=(0.06, 0.16),
-                          axes=(1, 2), thr_frac=f, soft_frac=gg)
-                B.connect(h[1::2], srch[hf:], k=kh, w_range=(0.06, 0.16),
-                          axes=(1, 2), thr_frac=f, soft_frac=gg)
+                if one:
+                    # 一条专用线：每个上游神经元配一个自己的中继，只接这一个，原样传下去
+                    prevs = lay if hj == 0 else hops[-1]
+                    pp = B.xyz(prevs)
+                    hc = len(prevs)
+                    hp = np.stack([np.full(hc, xh), pp[:, 1], pp[:, 2]],
+                                  axis=1).astype(np.float32)
+                    # 门槛 0、带宽 = 权重 → 中继就是一根线，活动等于上游活动
+                    h = B.add(f"wire_{name}_L{li}_{hj}", hp, thr=0.0, soft=1.0)
+                    B.link(prevs, h, w_range=(1.0, 1.0), group=GROUP_PFC_FWD)
+                else:
+                    hc = max(2, int(round(cnt * (0.4 + 0.3 * hj))))
+                    yh = np.linspace(y0, y1, hc)
+                    zh = np.linspace(0.10, 0.90, hc)
+                    hp = np.stack([np.full(hc, xh), yh, zh], axis=1).astype(np.float32)
+                    h = B.add(f"hop_{name}_L{li}_{hj}", hp, thr=0.30, soft=0.35)
+                    srch = lay if hj == 0 else hops[-1]
+                    hf = len(srch) // 2
+                    kh = max(3, min(32, hf // 8))
+                    f, gg = DEPTH_FRAC.get(li, (0.25, 0.45))
+                    B.connect(h[0::2], srch[:hf], k=kh, w_range=(0.06, 0.16),
+                              axes=(1, 2), thr_frac=f, soft_frac=gg,
+                              group=GROUP_PFC_FWD,
+                              nearest=(sp.chain_mode != "random"),
+                              exact=(sp.pick_mode == "exact"))
+                    B.connect(h[1::2], srch[hf:], k=kh, w_range=(0.06, 0.16),
+                              axes=(1, 2), thr_frac=f, soft_frac=gg,
+                              group=GROUP_PFC_FWD,
+                              nearest=(sp.chain_mode != "random"),
+                              exact=(sp.pick_mode == "exact"))
                 hops.append(h)
+            ids.setdefault("hops", {})[(name, li)] = hops
             srcg = hops[-1]
             gf = len(srcg) // 2
             kg = max(3, min(sp.k_near, gf // 8))
             f, gg = DEPTH_FRAC.get(li, (0.25, 0.45))
             B.connect(g[0::2], srcg[:gf], k=kg, w_range=(0.06, 0.16),
-                      axes=(1, 2), thr_frac=f, soft_frac=gg)
+                      axes=(1, 2), thr_frac=f, soft_frac=gg, group=GROUP_PFC_FWD,
+                      exact=(sp.pick_mode == "exact"))
             B.connect(g[1::2], srcg[gf:], k=kg, w_range=(0.06, 0.16),
-                      axes=(1, 2), thr_frac=f, soft_frac=gg)
+                      axes=(1, 2), thr_frac=f, soft_frac=gg, group=GROUP_PFC_FWD,
+                      exact=(sp.pick_mode == "exact"))
             # ---- 回程：去程的原路反向（前额叶组 → 返回中继 → 回到这一层按位置最近的神经元）
             # 门槛 = 自己的阈值 + 抑制神经元（两者一起起作用）
             gsz = len(g)
@@ -216,7 +256,9 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
                 # 返回中继接**一大片**前额叶（多对一，汇合）；以及抑制细胞压住它
                 B.connect(r, prevr, k=min(len(prevr), 48), w_range=(0.05, 0.12),
                           axes=(1, 2), thr_frac=0.35, soft_frac=0.40, group=17)
-                B.connect(r, rg, k=1, w_range=(0.55, 0.65), axes=(1, 2), group=18)
+                # 抑制细胞只压第一级回程中继：第二级如果再被压一次，回程永远传不回去
+                if hj == 0:
+                    B.connect(r, rg, k=1, w_range=(0.55, 0.65), axes=(1, 2), group=18)
                 if hj == 1 and li > 1:   # 第1层是外界直接驱动的传感器，回程不能落回那里      # 最后一级送回**原来那一层**，位置对位置
                     B.connect(lay, r, k=2, w_range=(0.06, 0.16), axes=(1, 2),
                               thr_frac=0.25, soft_frac=0.45, group=19)
@@ -316,15 +358,15 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
         B.connect(ids["force"][m], ids["inh"][m], k=1, w_range=(0.25, 0.35),
                   axes=(1, 2), group=15)
     ids["inh_out"] = (B.group == 15)
-    # 参与整体阈值调控统计的只保留**各区各层**：
-    # 前额叶、路上各级、回程、门控、力度都不计入 —— 它们体量最大，算进去会把调控带偏，
-    # 各区各层反而被饿着（第3、4层就是这样死掉的）。
+    # 参与整体阈值调控统计的只保留**各区各层**（这条先按原样保留：
+    # 把中继/前额叶也算进 counted 会让 target 变大、gain 维持负值，
+    # 是现在深层/PFC 还能活着的隐性条件之一；要改必须连同 gain 目标一起重新标定）。
     BIG = re.compile(r"^(ret_|rt_inh_|down|inh|force|gate|dis)")   # 路上/前额叶也纳入统计
     for i in range(B.n):
         if BIG.match(B.region[i]):
             B.counted[i] = False
     # ---- 统一按深度定门槛（最后一手，保证生效；比例按实测驱动量级取）----
-    _DEPTH = {1: (0.30, 0.90), 2: (0.26, 0.45), 3: (0.22, 0.32), 4: (0.22, 0.28)}
+    _DEPTH = DEPTH_GAIN
     # 只统计**前向边**的权重和（来源不是 ret_ 的边）：
     # 回程边不该把门槛顶上去，否则门槛虚高、神经元永远够不着
     _fwd = np.array([not B.region[int(x)].startswith("ret_") for x in B.src])
@@ -340,7 +382,9 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
             if _m:
                 _depth = int(_m.group(1))
         if _r.startswith("ret_"):
-            _f, _g = 2.0, 1.0      # 回程门槛设很高：只有前额叶一大片同时活跃才打得开
+            # 原来是 2.0×入边权重和：act≤1 时驱动最多等于权重和，回程**永远打不开**。
+            # 改成 0.5×：要接近一半的输入同时活跃才过门槛，仍是"一大片才开"的用意。
+            _f, _g = 0.5, 0.6
         elif _depth in _DEPTH:
             _f, _g = _DEPTH[_depth]
             if _r.startswith("hop_"):
@@ -356,8 +400,9 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
             _soft[_i] = max(1e-4, _g * _sw[_i])
     B.thr = _thr.tolist()
     B.soft = _soft.tolist()
-    # 整体阈值调控：目标活跃 = 各区细胞的 30%（只统计各区各层，见上面 counted 的设置）
-    cfg.target_active = max(5, int(0.10 * int(np.sum(B.counted))))   # 目标活跃 10%
+    # 整体阈值调控：目标活跃 = counted 的 10%（暂时保留原值；改这个必须重新标定 gain，
+    # 否则目标一变，gain 顶到 ±0.05，第 3/4 层会整层死掉）
+    cfg.target_active = max(5, int(0.10 * int(np.sum(B.counted))))
 
     if verbose:
         print(f"输入编码 {sum(2 * v * L for v in modalities.values())} 个"
