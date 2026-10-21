@@ -185,7 +185,8 @@ def region_margin(B, ui, ids: dict, sp, region: str, n: int = 8, steps: int = PR
     返回 ratio（同底图/不同底图，越低越分得开）和 min_diff（不同底图的最小距离，越高越好）。
     """
     rng = np.random.default_rng(seed)
-    groups = [ids["pfc_groups"][(region, d)] for d in (1, 2, 3, 4)]
+    ds = sorted(d for (r, d) in ids["pfc_groups"] if r == region)
+    groups = [ids["pfc_groups"][(region, d)] for d in ds]
     code_ids = np.concatenate([g[B.alive[g]] for g in groups])
 
     def rand_input():
@@ -342,8 +343,8 @@ def grow_layer(B, ids: dict, acts, sp, geo: Geometry, region: str, depth: int,
     f0, g0 = DEPTH_GAIN.get(depth, (0.25, 0.45))
     hops = ids["hops"][(region, depth)]
     g_pfc = ids["pfc_groups"][(region, depth)]
+    x0 = float(np.mean(B.xyz(lay)[:, 0]))
     f2, g2 = 0.3 * f0, 0.5 * g0      # 前额叶接收端的门槛/带宽比例（同 build）
-    x0 = float(geo.x_in + 0.10)
     new_ids = []
     for pid in parents:
         e = np.nonzero(B.dst == pid)[0]

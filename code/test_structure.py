@@ -32,7 +32,8 @@ def force_levels(B, ids, sp, ks=(2, 4, 6, 8, 10)):
 
 def main() -> int:
     sp = Spec(px=3, n_level=4, n_audio=6, n_touch=6, n_balance=3,
-              n_muscle=2, n_force=4, k_near=6, layer_floor=(24, 32, 48))
+              n_muscle=2, n_force=4, k_near=6,
+              layer_ratio=(2.0, 4.0, 6.0), layer_floor=(24, 32, 48))
     B, ids, sp, geo = build(sp, Config(), verbose=False)
     ui = Interface(B, ids, sp)
     ref_calibrate(B, ids, ui, passes=1, steps=20)

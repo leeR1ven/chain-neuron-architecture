@@ -76,9 +76,69 @@ class Geometry:
     x_motor: float = 0.85
 
 
+REGIONS = ("vision", "audio", "touch", "balance")
+
+
+def validate_spec(sp: "Spec", geo: "Geometry") -> list:
+    """检查规格自洽；返回错误列表（build 会在开始前统一抛出）。
+
+    这里只查"架构上一定不成立"的事，不查效果：
+      · 层数 = len(layer_ratio)，layer_floor 必须一一对应；
+      · 每层深度必须在 DEPTH_FRAC/DEPTH_GAIN 里有定义；
+      · 四个区都在、条带在 [0,1] 内且互不重叠；
+      · 沿 x 的顺序：输入 < 层 < 前额叶 < 运动区；
+      · 通道数/档数/肌肉数/力度档都 > 0。
+    """
+    e = []
+    for nm, v in (("px", sp.px), ("n_rgb", sp.n_rgb), ("n_level", sp.n_level),
+                  ("n_audio", sp.n_audio), ("n_touch", sp.n_touch),
+                  ("n_balance", sp.n_balance), ("n_muscle", sp.n_muscle),
+                  ("n_force", sp.n_force), ("k_near", sp.k_near)):
+        if int(v) < 1:
+            e.append(f"{nm} 必须 ≥ 1（现在是 {v}）")
+    L = len(sp.layer_ratio)
+    if L < 1:
+        e.append("layer_ratio 至少要有 1 个数（L2…）")
+    if len(sp.layer_floor) != L:
+        e.append(f"layer_floor 长度 {len(sp.layer_floor)} 必须等于 layer_ratio 长度 {L}")
+    if any(float(r) <= 0 for r in sp.layer_ratio):
+        e.append("layer_ratio 只能是正数")
+    if any(b <= a for a, b in zip(sp.layer_ratio, sp.layer_ratio[1:])):
+        e.append("layer_ratio 必须递增（越靠近前额叶越多）")
+    for d in range(1, L + 2):
+        if d not in DEPTH_FRAC:
+            e.append(f"DEPTH_FRAC 缺第 {d} 层（layer_ratio 太长）")
+        if d not in DEPTH_GAIN:
+            e.append(f"DEPTH_GAIN 缺第 {d} 层（layer_ratio 太长）")
+    for r in REGIONS:
+        if r not in geo.bands:
+            e.append(f"Geometry.bands 缺区 {r}")
+            continue
+        y0, y1 = geo.bands[r]
+        if not (0.0 <= y0 < y1 <= 1.0):
+            e.append(f"{r} 的条带 ({y0},{y1}) 必须满足 0 ≤ y0 < y1 ≤ 1")
+    spans = sorted((geo.bands[r][0], geo.bands[r][1], r)
+                   for r in REGIONS if r in geo.bands)
+    for (a0, a1, an), (b0, b1, bn) in zip(spans, spans[1:]):
+        if b0 < a1:
+            e.append(f"区 {an} 与 {bn} 的条带重叠：[{a0},{a1}] / [{b0},{b1}]")
+    if not (geo.x_in < geo.x_in + 0.10 < geo.x_pfc - 0.04 < geo.x_pfc < geo.x_motor):
+        e.append("x 顺序必须是：输入 < 各层起点 < 前额叶 < 运动区")
+    if sp.chain_mode not in ("one2one", "knn", "random"):
+        e.append(f"chain_mode 只能是 one2one/knn/random（现在是 {sp.chain_mode}）")
+    if sp.pick_mode not in ("random", "exact"):
+        e.append(f"pick_mode 只能是 random/exact（现在是 {sp.pick_mode}）")
+    if sp.pfc_ratio <= 0:
+        e.append("pfc_ratio 必须 > 0")
+    return e
+
+
 def build(sp: Spec | None = None, cfg: Config | None = None,
           geo: Geometry | None = None, verbose: bool = True):
     sp, cfg, geo = sp or Spec(), cfg or Config(), geo or Geometry()
+    errs = validate_spec(sp, geo)
+    if errs:
+        raise ValueError("Spec/Geometry 不合法：\n- " + "\n- ".join(errs))
     B = Brain(cfg)
     L = sp.n_level
     ids: dict = {}
@@ -190,12 +250,12 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
             g = B.add(f"pfc_{name}_L{li}", p, thr=0.30, soft=0.35)
             ids.setdefault("pfc_groups", {})[(name, li)] = g
             # 这一层到前额叶之间，**每隔一小段放一级神经元**，一节一节往前送；
-            # 越靠近前额叶这一级数量越多
-            x0 = float(geo.x_in + 0.10)
+            # 中继从**这一层自己的 x** 出发（深层不能把信号往身后的中继送）
+            x_lay = float(np.mean(B.xyz(lay)[:, 0]))
             hops = []
             one = sp.chain_mode == "one2one"
             for hj, frac in enumerate((1 / 3, 2 / 3)):
-                xh = x0 + (geo.x_pfc - x0) * frac
+                xh = x_lay + (geo.x_pfc - x_lay) * frac
                 if one:
                     # 一条专用线：每个上游神经元配一个自己的中继，只接这一个，原样传下去
                     prevs = lay if hj == 0 else hops[-1]
@@ -250,12 +310,12 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
                 B.connect(rg, g, k=min(gsz, 12), w_range=(0.010, 0.020), axes=(1, 2),
                           thr_frac=0.02, soft_frac=0.05, group=16, nearest=False)
                 prevr = g
-                for hj, frac in enumerate((2 / 3, 1 / 3)):
-                    # 回程中继要少：它们是调制，不是第二条前向通路（边数按"≤前向一半"卡）
+                for hj, frac in enumerate((1 / 3, 2 / 3)):
+                    # 回程中继：从前额叶往**这一层自己的 x** 退（第一级靠前额叶、第二级靠层）
                     rc = max(2, min(int(round(gsz * (0.20 - 0.08 * hj))), 16))
                     yh = np.linspace(y0, y1, rc)
                     zh = np.linspace(0.10, 0.90, rc)
-                    xh = geo.x_in + 0.10 + (geo.x_pfc - geo.x_in - 0.10) * frac
+                    xh = geo.x_pfc - (geo.x_pfc - x_lay) * frac
                     rp = np.stack([np.full(rc, xh), yh, zh], axis=1).astype(np.float32)
                     r = B.add(f"ret_{name}_L{li}_{hj}", rp, thr=0.30, soft=0.35)
                     # 第一级只看 6 条**铺开**的前额叶、第二级只看 4 条上一级：
@@ -280,8 +340,9 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
     ids["pfc"] = pfc
 
     # 前额叶里指定"运动相关"（每块肌肉 n_force 个）与"非运动"
-    # 运动相关：前额叶里**成片的一块**（取视觉最后一组的前 n_motor 个，位置是连着的）
-    base = ids["pfc_vision_L4"]
+    # 运动相关：前额叶里**成片的一块**（取视觉**最后一层**的前 n_motor 个，位置是连着的）
+    vision_last = max(d for (r, d) in ids["pfc_groups"] if r == "vision")
+    base = ids["pfc_groups"][("vision", vision_last)]
     ids["motor_pfc"] = [base[m * sp.n_force:(m + 1) * sp.n_force]
                         for m in range(sp.n_muscle)]
     motor_pick = np.concatenate(ids["motor_pfc"])
@@ -387,7 +448,7 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
         _r = B.region[_i]
         _depth = None
         if _r.startswith(("hop_", "pfc_", "ret_")) or re.search(r"_L\d+$", _r):
-            _m = re.search(r"_L(\d)", _r)
+            _m = re.search(r"_L(\d+)(?:_|$)", _r)
             if _m:
                 _depth = int(_m.group(1))
         if _r.startswith("ret_"):
