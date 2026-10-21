@@ -56,10 +56,14 @@ def main() -> int:
           bool(np.all(np.abs(np.asarray(B.thr)[wires]) < 1e-9))
           and bool(np.all(np.abs(np.asarray(B.soft)[wires] - 1.0) < 1e-6)))
 
-    # 2) 常亮/常灭不往前额叶送
+    # 2) 常亮/常灭不往前额叶送（造一个"常亮来源"，确认它进额叶的边被去掉）
     rand = S.make_random_probes(sp, n=4)
     ch = S.make_change_probes(sp, per_region=2)
     acts_all = np.vstack([S.observe(B, ui, rand, 40), S.observe(B, ui, ch, 40)])
+    fwd_src = np.unique(B.src[B.group == GROUP_PFC_FWD])
+    check("有前向边可筛", len(fwd_src) > 0)
+    if len(fwd_src):
+        acts_all[:, fwd_src[0]] = 1.0      # 人为常亮：std=0、均值>0.5
     e0, n0 = len(B.src), B.n_alive
     st = S.prune_constant_pfc(B, acts_all)
     check("常亮筛选：有边被去掉", st["edges_removed"] > 0, st)
@@ -73,11 +77,15 @@ def main() -> int:
     key = ("audio", 4)
     lay0 = ids["layers"][key]
     before = int(B.alive[lay0].sum())
+    npfc0 = len(ids["pfc_groups"][key])
     new = S.grow_layer(B, ids, acts_all, sp, geo, "audio", 4, fraction=0.05,
                        children=2, k_in=2, seed=0)
     after = int(B.alive[ids["layers"][key]].sum())
     check("加神经元生效", len(new) > 0 and after >= before + len(new),
           f"{before} -> {after}（+{len(new)}）")
+    check("前额叶接收端按比例 +1/子单元",
+          len(ids["pfc_groups"][key]) == npfc0 + len(new),
+          f"{npfc0} -> {len(ids['pfc_groups'][key])}")
     din = np.bincount(B.dst, minlength=B.n)
     dout = np.bincount(B.src, minlength=B.n)
     check("新神经元各 2 条输入", bool(np.all(din[new] == 2)), din[new].tolist())

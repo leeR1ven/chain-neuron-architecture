@@ -5,11 +5,12 @@
 每一层经中继送前额叶、回程调制、运动区分档、门控都保持原样），只改"链上有多少神经元、
 哪些信号继续往前额叶送"：
 
-  1. **加神经元**：立体网络最新版把局部增删做到了 L2–L5（稳定 ID、不重建下游），
-     链里也支持**任何一层**（候选：前额叶、L3、L2、L4），逐层试、按目标区相似度选层。
+  1. **加神经元**：链的区内链是 L1 传感器 + L2–L5；候选层就是 L2–L5，逐层试、按目标区相似度选层。
      每层规则：使用率 40–60% 的父单元，5% 父单元 → 每个拆 2 个子单元、各拿 2 条输入；
-     子单元局部重连下一层，并各配专用线送前额叶。
-     实测：中等规模 PFC 0.283→0.212 / L2 0.233 / L3 0.240 / L4 0.431——L4 不适合加，不是每层都一样。
+     子单元局部重连下一层，并各配专用线送前额叶；每加一个子单元，
+     给这一层的前额叶组 +1 个接收神经元（前额叶是落点，不是候选层）。
+     加完**不重标定整网**（实测重标会把提升洗掉：L3 0.192→0.178，重标后 0.203）。
+     实测：中等规模 L2 0.566 / L3 0.543 / L4 0.532 / L5 0.511——越深越好。
   2. **减神经元**：只删两类——
        跨输入几乎不激活的（没用），
        跨输入始终同一读数的（常亮/常灭，不带特征）。
@@ -123,9 +124,42 @@ def feature_score(acts: np.ndarray) -> np.ndarray:
     return std / (std + FEAT_EPS)
 
 
-def region_similarity(B, acts, ids: dict, probes, region: str) -> float:
-    """前额叶对"该区不同通道变化"的响应图案两两 |余弦|；越低越分得开。"""
-    g = ids["pfc_groups"][(region, 4)]
+def region_similarity_at(B, acts, ids: dict, probes, region: str, depth: int) -> float:
+    """只看某一层那一组前额叶的相似度（用来防止"总码变好、某一组塌掉"）。"""
+    g = ids["pfc_groups"][(region, depth)]
+    g = g[B.alive[g]]
+    sel = [k for k, p in enumerate(probes) if p.region == region]
+    if len(g) == 0 or len(sel) < 2:
+        return float("nan")
+    D = acts[sel][:, g] - acts[0, g]
+    nrm = np.linalg.norm(D, axis=1)
+    keep = nrm > 1e-6
+    if int(keep.sum()) < 2:
+        return float("nan")
+    M = D[keep] / nrm[keep, None]
+    S = np.abs(M @ M.T)
+    off = S[~np.eye(len(S), dtype=bool)]
+    return float(off.mean())
+
+
+def region_group_sims(B, acts, ids: dict, probes, region: str) -> dict:
+    ds = sorted(d for (r, d) in ids["pfc_groups"] if r == region)
+    return {d: region_similarity_at(B, acts, ids, probes, region, d) for d in ds}
+
+
+def region_similarity(B, acts, ids: dict, probes, region: str,
+                      all_groups: bool = False) -> float:
+    """前额叶对"该区不同通道变化"的响应图案两两 |余弦|；越低越分得开。
+
+    all_groups=True：把这个区 L1–L4 的前额叶组拼起来看
+    （加在 L2/L3 的神经元只进各自那一组，只看 L4 组会看不到）。
+    """
+    if all_groups:
+        ds = sorted(d for (r, d) in ids["pfc_groups"] if r == region)
+        g = np.concatenate([ids["pfc_groups"][(region, d)] for d in ds])
+    else:
+        g = ids["pfc_groups"][(region, max(d for (r, d) in ids["pfc_groups"]
+                                           if r == region))]
     g = g[B.alive[g]]
     sel = [k for k, p in enumerate(probes) if p.region == region]
     if len(g) == 0 or len(sel) < 2:
@@ -141,8 +175,9 @@ def region_similarity(B, acts, ids: dict, probes, region: str) -> float:
     return float(off.mean())
 
 
-def all_similarities(B, acts, ids: dict, probes) -> dict:
-    return {r: region_similarity(B, acts, ids, probes, r) for r in REGIONS}
+def all_similarities(B, acts, ids: dict, probes, all_groups: bool = False) -> dict:
+    return {r: region_similarity(B, acts, ids, probes, r, all_groups=all_groups)
+            for r in REGIONS}
 
 
 def region_margin(B, ui, ids: dict, sp, region: str, n: int = 8, steps: int = PROBE_STEPS,
@@ -298,6 +333,7 @@ def grow_layer(B, ids: dict, acts, sp, geo: Geometry, region: str, depth: int,
     f0, g0 = DEPTH_GAIN.get(depth, (0.25, 0.45))
     hops = ids["hops"][(region, depth)]
     g_pfc = ids["pfc_groups"][(region, depth)]
+    f2, g2 = 0.3 * f0, 0.5 * g0      # 前额叶接收端的门槛/带宽比例（同 build）
     x0 = float(geo.x_in + 0.10)
     new_ids = []
     for pid in parents:
@@ -319,8 +355,9 @@ def grow_layer(B, ids: dict, acts, sp, geo: Geometry, region: str, depth: int,
             s = float(np.abs(W).sum())
             B.thr[child] = max(1e-4, f0 * s)
             B.soft[child] = max(1e-4, g0 * s)
-            # 局部重连下游（L2/L3 的下一层；L4 的下一层是前额叶，用下面的专用线）
-            if depth < 4:
+            # 局部重连下游（不是最后一层时；最后一层的下一层就是前额叶，用下面的专用线）
+            last = max(d for (r, d) in ids["layers"] if r == region)
+            if depth < last:
                 nxt = ids["layers"][(region, depth + 1)]
                 nxt = nxt[B.alive[nxt]]
                 if len(nxt):
@@ -342,6 +379,19 @@ def grow_layer(B, ids: dict, acts, sp, geo: Geometry, region: str, depth: int,
                 B.connect(g, prev, k=3, w_range=(0.06, 0.16), axes=(1, 2),
                           group=GROUP_PFC_FWD,
                           exact=(sp.pick_mode == "exact"))
+            # 前额叶接收端也按比例 +1：链的终点跟着扩容（相当于立体网络加完神经元要扩 top-k），
+            # 它不是"另一层"，是这一层信号的落点
+            gp = ids["pfc_groups"][(region, depth)]
+            src_h = hops[1][B.alive[hops[1]]]
+            if len(src_h):
+                pfc_pos = np.array([[geo.x_pfc, pos[1], pos[2]]], dtype=np.float32)
+                pc = int(B.add(f"pfc_{region}_L{depth}", pfc_pos,
+                               thr=0.30, soft=0.35)[0])
+                B.connect([pc], src_h, k=2, w_range=(0.06, 0.16), axes=(1, 2),
+                          thr_frac=f2, soft_frac=g2, group=GROUP_PFC_FWD,
+                          exact=(sp.pick_mode == "exact"))
+                ids["pfc_groups"][(region, depth)] = np.r_[gp, pc]
+                _rebuild_pfc_index(ids)
             new_ids.append(child)
 
     new_ids = np.asarray(new_ids, dtype=int)
@@ -354,7 +404,8 @@ def grow_layer(B, ids: dict, acts, sp, geo: Geometry, region: str, depth: int,
 def _rebuild_pfc_index(ids: dict) -> None:
     """加了前额叶神经元后，重建按区/按类的索引（gate 用的 other_pfc 也要跟着更新）。"""
     def layers(r):
-        return [ids["pfc_groups"][(r, d)] for d in (1, 2, 3, 4)]
+        ds = sorted(d for (rr, d) in ids["pfc_groups"] if rr == r)
+        return [ids["pfc_groups"][(r, d)] for d in ds]
 
     ids["pfc_vision"] = np.concatenate(layers("vision"))
     ids["pfc_other"] = np.concatenate([g for r in ("audio", "touch", "balance")
@@ -473,44 +524,41 @@ def evolve(B, ids, ui, sp, geo: Geometry, rounds: int = 3, grow_frac: float = 0.
     # 加神经元要用改动后的活动矩阵
     acts_all = np.vstack([observe(B, ui, probes, steps),
                           observe(B, ui, rand, steps)])
+    # 选层要看这个区**所有层**的前额叶组（加在 L2/L3 只进各自那一组，只看 L4 会看不到）
+    sims_all = all_similarities(B, acts_all[:len(probes)], ids, probes, all_groups=True)
 
-    # ③ 逐轮给最难分的那一区加神经元
+    # ③ 逐轮给最难分的那一区加神经元（候选是区内的 L2/L3/L4；前额叶是落点，不是候选层）
     for r in range(rounds):
         finite = {k: v for k, v in sims.items() if np.isfinite(v)}
         if not finite:
             break
         region = max(finite, key=finite.get)
         depth = 4
+        s_before_g = region_group_sims(B, acts_all[:len(probes)], ids, probes, region)
         snapB, snapIds = copy.deepcopy(B), copy.deepcopy(ids)
         added = np.zeros(0, dtype=int)
         mode_used, depth_used = grow_target, 4
         margin_before = margin_after = None
         if grow_target == "auto":
-            # 立体网络现在 L2–L5 都能局部增删；链里也一样：逐层试，按"该区相似度"选最好的那层。
-            # （margin 也量，但这里只作记录：8 张参考图下最小距离太噪，选层用相似度更稳）
             margin_before = region_margin(B, ui, ids, sp, region, n=8, steps=steps,
                                           seed=seed + r)
-            cands = [("pfc", 4), ("layer", 3), ("layer", 2), ("layer", 4)]
+            cands = [("layer", d) for d in range(2, 2 + len(sp.layer_ratio))]
             best = None
             for cmode, cdepth in cands:
                 B, ids = copy.deepcopy(snapB), copy.deepcopy(snapIds)
                 ui = Interface(B, ids, sp)
-                if cmode == "pfc":
-                    new = grow_pfc(B, ids, acts_all, sp, geo, region, cdepth,
-                                   fraction=0.05, children=2, k_in=2,
-                                   seed=seed + 100 + r)
-                else:
-                    new = grow_layer(B, ids, acts_all, sp, geo, region, cdepth,
-                                     fraction=0.05, children=2, k_in=2,
-                                     seed=seed + 100 + r)
+                new = grow_layer(B, ids, acts_all, sp, geo, region, cdepth,
+                                 fraction=0.05, children=2, k_in=2,
+                                 seed=seed + 100 + r)
                 if len(new) == 0:
                     continue
-                ref_calibrate(B, ids, ui, passes=1, steps=28)
+                # 加完**不重标定**：只给新神经元/新接收端设了门槛，老神经元不动
+                # （实测重标会把加层带来的提升洗掉：L3 0.192→0.178 变好，重标后又回到 0.203）
                 sim_try = region_similarity(B, observe(B, ui, probes, steps),
-                                            ids, probes, region)
+                                            ids, probes, region, all_groups=True)
                 if verbose:
-                    print(f"    试 {cmode} L{cdepth}: +{len(new)}  "
-                          f"该区相似度 {sims.get(region, float('nan')):.4f} → {sim_try:.4f}")
+                    print(f"    试 L{cdepth}: 区内 +{len(new)}（含中继/接收端） "
+                          f"该区相似度 {sims_all.get(region, float('nan')):.4f} → {sim_try:.4f}")
                 if best is None or sim_try < best[5]:
                     best = (copy.deepcopy(B), copy.deepcopy(ids), cmode, cdepth,
                             new, sim_try)
@@ -519,28 +567,39 @@ def evolve(B, ids, ui, sp, geo: Geometry, rounds: int = 3, grow_frac: float = 0.
                 break
             B, ids, mode_used, depth_used, added, _ = best
             ui = Interface(B, ids, sp)
-            ref_calibrate(B, ids, ui, passes=post_passes, steps=post_steps)
             margin_after = region_margin(B, ui, ids, sp, region, n=8, steps=steps,
                                          seed=seed + r)
             sims_new = all_similarities(B, observe(B, ui, probes, steps), ids, probes)
-            delta = (sims.get(region, np.nan) - sims_new.get(region, np.nan))
-            others = [sims_new[k] - sims[k] for k in sims
-                      if k != region and np.isfinite(sims[k]) and np.isfinite(sims_new[k])]
+            sims_new_all = all_similarities(B, observe(B, ui, probes, steps), ids,
+                                            probes, all_groups=True)
+            # 防"总码变好、某一层的前额叶组塌掉"：逐组比较，最差的那组不许掉超过 0.02
+            acts_b = observe(B, ui, probes, steps)
+            s_after_g = region_group_sims(B, acts_b, ids, probes, region)
+            worst_group = min((s_after_g.get(d, 0.0) - s_before_g.get(d, 0.0))
+                              for d in s_before_g)
+            delta = (sims_all.get(region, np.nan) - sims_new_all.get(region, np.nan))
+            others = [sims_new_all[k] - sims_all[k] for k in sims_all
+                      if k != region and np.isfinite(sims_all[k])
+                      and np.isfinite(sims_new_all[k])]
             worst_other = max(others) if others else 0.0
-            improved = bool(np.isfinite(delta) and delta > 0.01 and worst_other < 0.02)
+            improved = bool(np.isfinite(delta) and delta > 0.01
+                            and worst_group > -0.02 and worst_other < 0.02)
+            if improved:
+                sims_all = sims_new_all
         else:
+            last = max(d for (r, d) in ids["layers"] if r == region)
             if grow_target == "pfc":
-                added = grow_pfc(B, ids, acts_all, sp, geo, region, 4,
+                added = grow_pfc(B, ids, acts_all, sp, geo, region, last,
                                  fraction=0.05, children=2, k_in=2,
                                  seed=seed + 100 + r)
             else:
-                added = grow_layer(B, ids, acts_all, sp, geo, region, 4,
+                added = grow_layer(B, ids, acts_all, sp, geo, region, last,
                                    fraction=0.05, children=2, k_in=2,
                                    seed=seed + 100 + r)
             if len(added) == 0:
                 B, ids, ui = snapB, snapIds, Interface(snapB, snapIds, sp)
                 break
-            ref_calibrate(B, ids, ui, passes=post_passes, steps=post_steps)
+            # 同样不重标定：只让新神经元用自己的门槛
             sims_new = all_similarities(B, observe(B, ui, probes, steps), ids, probes)
             delta = (sims.get(region, np.nan) - sims_new.get(region, np.nan))
             others = [sims_new[k] - sims[k] for k in sims
@@ -597,7 +656,7 @@ def main(argv=None) -> int:
     else:
         sp = Spec(px=6, n_level=6, n_audio=10, n_touch=16, n_balance=4,
                   n_muscle=2, n_force=5, k_near=8,
-                  layer_ratio=(2.0, 4.0, 6.0), layer_floor=(96, 128, 160))
+                  layer_ratio=(2.0, 4.0, 6.0, 8.0), layer_floor=(96, 128, 160, 192))
     B, ids, sp, geo = build(sp, Config(), verbose=True)
     ui = Interface(B, ids, sp)
     ref_calibrate(B, ids, ui)

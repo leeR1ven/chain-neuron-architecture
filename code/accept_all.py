@@ -17,8 +17,8 @@ from build import Interface, Spec, build  # noqa: E402
 from calib import ref_calibrate  # noqa: E402
 
 sp = Spec(px=10, n_rgb=3, n_level=10, n_audio=20, n_touch=40, n_balance=6,
-          n_muscle=8, n_force=10, k_near=8, layer_ratio=(2.0, 4.0, 6.0),
-          layer_floor=(128, 192, 256))
+          n_muscle=8, n_force=10, k_near=8, layer_ratio=(2.0, 4.0, 6.0, 8.0),
+          layer_floor=(128, 192, 256, 320))
 B, ids, sp, geo = build(sp, Config(), verbose=True)
 ui = Interface(B, ids, sp)
 ref_calibrate(B, ids, ui)
@@ -42,7 +42,7 @@ a0 = run(base_img, BASE)
 for nm, key, n, step in (("视觉", "vision", P * P * C, 10), ("听觉", "audio", sp.n_audio, 1),
                          ("触觉", "touch", sp.n_touch, 4), ("平衡", "balance", sp.n_balance, 1)):
     idx = list(range(0, n, step))
-    c2 = c3 = c4 = cpf = 0
+    c2 = c3 = c4 = c5 = cpf = 0
     vecs = []
     for c in idx:
         if key == "vision":
@@ -52,13 +52,15 @@ for nm, key, n, step in (("视觉", "vision", P * P * C, 10), ("听觉", "audio"
             s = {k: x.copy() for k, x in BASE.items()}
             s[key][c] = 0.67
             a1 = run(base_img, s)
-        for tag, gid in (("2", f"{key}_L2"), ("3", f"{key}_L3"), ("4", f"{key}_L4")):
+        for tag, gid in (("2", f"{key}_L2"), ("3", f"{key}_L3"),
+                         ("4", f"{key}_L4"), ("5", f"{key}_L5")):
             g = ids[gid]
             d = np.abs(a1[g] - a0[g]).max() > 1e-4
             c2 += d if tag == "2" else 0
             c3 += d if tag == "3" else 0
             c4 += d if tag == "4" else 0
-        gp = B.ids_of(f"pfc_{key}_L4")
+            c5 += d if tag == "5" else 0
+        gp = B.ids_of(f"pfc_{key}_L5")
         dd = a1[gp] - a0[gp]
         cpf += np.abs(dd).max() > 1e-4
         vecs.append(dd)
@@ -66,7 +68,8 @@ for nm, key, n, step in (("视觉", "vision", P * P * C, 10), ("听觉", "audio"
     Mn = M / (np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
     S = Mn @ Mn.T
     off = S[~np.eye(len(S), dtype=bool)]
-    print(f"   {nm:4s} 抽样{len(idx):3d}：各层 {c2}/{len(idx)} {c3}/{len(idx)} {c4}/{len(idx)}"
+    print(f"   {nm:4s} 抽样{len(idx):3d}：各层 {c2}/{len(idx)} {c3}/{len(idx)} "
+          f"{c4}/{len(idx)} {c5}/{len(idx)}"
           f" | 送前额叶 {cpf}/{len(idx)} | 图案相似度 {off.mean():.2f}")
 
 print("\n② 运动力度表（点亮前额叶运动相关组的个数 → 出力档位）")
