@@ -69,21 +69,21 @@ def main() -> int:
           st2["removed"] == st2["silent"] + st2["constant"], st2)
     check("减神经元：只减不增", B.n_alive <= n0)
 
-    # 3) 加神经元：2~4 条输入 + 1 条专用线接到中继
+    # 3) 加神经元：5% 父单元 × 2 子单元 × 2 条输入；L4 子单元配专用线
     key = ("audio", 4)
     lay0 = ids["layers"][key]
     before = int(B.alive[lay0].sum())
-    new = S.grow_layer(B, ids, acts_all, sp, geo, "audio", 4, fraction=0.2, seed=0)
+    new = S.grow_layer(B, ids, acts_all, sp, geo, "audio", 4, fraction=0.05,
+                       children=2, k_in=2, seed=0)
     after = int(B.alive[ids["layers"][key]].sum())
     check("加神经元生效", len(new) > 0 and after >= before + len(new),
           f"{before} -> {after}（+{len(new)}）")
     din = np.bincount(B.dst, minlength=B.n)
     dout = np.bincount(B.src, minlength=B.n)
-    check("新神经元 2~4 入", bool(np.all((din[new] >= 2) & (din[new] <= 4))),
-          din[new].tolist())
-    check("新神经元 1 出（接专用线）", bool(np.all(dout[new] == 1)))
+    check("新神经元各 2 条输入", bool(np.all(din[new] == 2)), din[new].tolist())
+    check("新神经元接到专用线", bool(np.all(dout[new] >= 1)))
     new_wires = np.array([i for i in range(B.n) if B.region[i].startswith("wire_audio_L4_g")])
-    check("新线仍是一对一", len(new_wires) > 0 and bool(np.all(
+    check("新线仍是一对一", len(new_wires) == 2 * len(new) and bool(np.all(
         np.bincount(B.dst, minlength=B.n)[new_wires] == 1)))
 
     # 3b) 按立体网络规则加在**前额叶**（链里的"最后一层"）：5% 父单元 × 2 子单元 × 2 输入
