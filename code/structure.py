@@ -15,10 +15,10 @@
        跨输入始终同一读数的（常亮/常灭，不带特征）。
      删完把它带死的 hop / 前额叶神经元级联删掉。
   3. **常亮不送前额叶**：用一批随机输入看**跨输入的起伏**（不是时间上的变化）。
-     std≈0 的神经元不把信号送进 hop / 前额叶（把它的入边去掉），
-     留下的都是有特征、能区分输入的那批。
-  4. 每次结构改动后重新标定门槛（按每个神经元自己的入边权重和 / 实测驱动），
-     再复测前额叶四区相似度；变差就回滚。
+     只筛"平均 > 0.5、std≈0"的常亮来源，把它进 hop / 前额叶的边去掉；
+     常灭的不在这里砍（参考输入不足时会误伤，完整规模实测过）。
+  4. 每次结构改动后重新标定门槛（步数必须和初始一致，28 步会把深层相似度带偏），
+     再复测前额叶四区相似度；定点改动只看目标区变好、别区不显著变差，否则回滚。
 
 用法：
     python structure.py            # 中等规模演示（几分钟）
@@ -162,21 +162,33 @@ def _cascade_empty(B, rounds: int = 4):
 
 
 def prune_constant_pfc(B, acts, feat_thr: float = FEAT_THR,
-                       group: int = GROUP_PFC_FWD) -> dict:
-    """常亮/常灭的神经元不往前额叶送：删掉它进入 hop / 前额叶的边。"""
+                       group: int = GROUP_PFC_FWD, always_on: bool = True,
+                       cascade: bool = False) -> dict:
+    """常亮（默认只筛"总是亮"）的神经元不往前额叶送：删掉它进入 hop / 前额叶的边。
+
+    只筛"总是亮"是因为：常灭的神经元确实没用，但**参考输入太少时**，
+    一个只是"这批输入没碰到"的神经元也会量成常灭；把它当前额叶入边删掉，
+    等于用样本不足的统计去砍通路（完整规模上实测：筛完前额叶反而更分不开）。
+    cascade 默认关：删边后没有输入的中继/前额叶神经元只是静默，留着不会影响余弦，
+    但删掉会改变前额叶响应向量的维度，反而把相似度指标带偏。
+    """
     feat = feature_score(acts)
+    mean = acts.mean(axis=0)
+    weak = feat < feat_thr
+    if always_on:
+        weak = weak & (mean > 0.5)
     m = B.group == group
-    drop = m & (feat[B.src] < feat_thr)
+    drop = m & weak[B.src]
     n_drop = int(drop.sum())
     w_drop = float(B.w[drop].sum()) if n_drop else 0.0
     if n_drop:
         keep = ~drop
         B.src, B.dst, B.w = B.src[keep], B.dst[keep], B.w[keep]
         B.sgn, B.group = B.sgn[keep], B.group[keep]
-    cascade = _cascade_empty(B)
+    dead = _cascade_empty(B) if cascade else []
     return {"edges_removed": n_drop, "weight_removed": w_drop,
-            "cascade_removed": len(cascade),
-            "sources_without_feature": int((feat < feat_thr).sum())}
+            "cascade_removed": len(dead),
+            "sources_without_feature": int(weak.sum())}
 
 
 def prune_useless(B, ids: dict, acts, mean_thr: float = SILENT,
@@ -208,7 +220,8 @@ def grow_layer(B, ids: dict, acts, sp, geo: Geometry, region: str, depth: int,
     rng = np.random.default_rng(seed)
     key = (region, depth)
     lay_all = ids["layers"][key]
-    lay = lay_all[B.alive[lay_all]]
+    # acts 可能是在这一轮之前量的（新加的神经元还没有活动记录）——只拿有记录的老神经元当父本
+    lay = lay_all[B.alive[lay_all] & (lay_all < acts.shape[1])]
     if len(lay) == 0:
         return np.zeros(0, dtype=int)
 
@@ -291,6 +304,7 @@ def _mean_sim(sims: dict) -> float:
 
 def evolve(B, ids, ui, sp, geo: Geometry, rounds: int = 3, grow_frac: float = 0.10,
            per_region: int = 5, feature_n: int = 8, steps: int = PROBE_STEPS,
+           post_passes: int = 2, post_steps: int = 40,
            seed: int = 0, verbose: bool = True):
     """先筛常亮，再按"最难分的那一区"逐轮加神经元；变差回滚。"""
     probes = make_change_probes(sp, per_region=per_region, seed=seed)
@@ -307,29 +321,39 @@ def evolve(B, ids, ui, sp, geo: Geometry, rounds: int = 3, grow_frac: float = 0.
     sims0 = all_similarities(B, acts_ch, ids, probes)
     report["before"] = {k: (None if not np.isfinite(v) else round(v, 4))
                         for k, v in sims0.items()}
+    sims = sims0
 
-    # ① 常亮/常灭：不往前额叶送
-    st = prune_constant_pfc(B, acts_all)
-    ref_calibrate(B, ids, ui, passes=2, steps=28)
-    report["gate"] = st
-    if verbose:
-        print(f"① 常亮筛选：去掉 {st['edges_removed']:,} 条进中继/前额叶的边"
-              f"（{st['sources_without_feature']} 个无特征来源），"
-              f"级联删 {st['cascade_removed']} 个中继/前额叶神经元")
+    # ①② 常亮不送额叶 + 减静默/常亮神经元：一起改，复测四区相似度；整体变差就整块回滚
+    snapB, snapIds = copy.deepcopy(B), copy.deepcopy(ids)
+    st_gate = prune_constant_pfc(B, acts_all)
+    st_prune = prune_useless(B, ids, acts_all)
+    if any(st_gate.values()) or any(st_prune.values()):
+        ref_calibrate(B, ids, ui, passes=post_passes, steps=post_steps)
+        acts_ch = observe(B, ui, probes, steps)
+        acts_rand = observe(B, ui, rand, steps)
+        sims1 = all_similarities(B, acts_ch, ids, probes)
+    else:
+        sims1 = sims0
+    if _mean_sim(sims1) > _mean_sim(sims0) + 0.01:
+        B, ids, ui = snapB, snapIds, Interface(snapB, snapIds, sp)
+        report["structure_skipped"] = True
+        if verbose:
+            print("①② 常亮筛选 + 减神经元：四区整体变差，已回滚（不动结构）")
+    else:
+        sims = sims1
+        report["gate"], report["prune"] = st_gate, st_prune
+        if verbose:
+            print(f"① 常亮筛选：去掉 {st_gate['edges_removed']:,} 条进中继/前额叶的边"
+                  f"（{st_gate['sources_without_feature']} 个常亮来源），"
+                  f"级联删 {st_gate['cascade_removed']} 个中继/前额叶神经元")
+            print(f"② 减神经元：静默 {st_prune['silent']}、常亮/常灭 {st_prune['constant']}，"
+                  f"实删 {st_prune['removed']}（级联 {st_prune['cascade_removed']}）")
 
-    # ② 从不用 / 常亮的神经元
-    acts_rand = observe(B, ui, rand, steps)
-    acts_all = np.vstack([observe(B, ui, probes, steps), acts_rand])
-    st = prune_useless(B, ids, acts_all)
-    if any(st.values()):
-        ref_calibrate(B, ids, ui, passes=1, steps=28)
-    report["prune"] = st
-    if verbose:
-        print(f"② 减神经元：静默 {st['silent']}、常亮/常灭 {st['constant']}，"
-              f"实删 {st['removed']}（级联 {st['cascade_removed']}）")
+    # 加神经元要用改动后的活动矩阵
+    acts_all = np.vstack([observe(B, ui, probes, steps),
+                          observe(B, ui, rand, steps)])
 
     # ③ 逐轮给最难分的那一区加神经元
-    sims = all_similarities(B, observe(B, ui, probes, steps), ids, probes)
     for r in range(rounds):
         finite = {k: v for k, v in sims.items() if np.isfinite(v)}
         if not finite:
@@ -342,9 +366,16 @@ def evolve(B, ids, ui, sp, geo: Geometry, rounds: int = 3, grow_frac: float = 0.
         if len(new) == 0:
             B, ids, ui = snapB, snapIds, Interface(snapB, snapIds, sp)
             break
-        ref_calibrate(B, ids, ui, passes=1, steps=28)
+        ref_calibrate(B, ids, ui, passes=post_passes, steps=post_steps)
         sims_new = all_similarities(B, observe(B, ui, probes, steps), ids, probes)
-        improved = _mean_sim(sims_new) < _mean_sim(sims) - 5e-3
+        # 结构改动是**定点**的：看目标区有没有变好，而不是要求四区平均都变好
+        # （加 16 个听觉神经元把听觉从 0.305 拉到 0.287，但重标定会让别的区抖 0.01，
+        #  按"平均"判会把这种真提升误判成变差）
+        delta = (sims.get(region, np.nan) - sims_new.get(region, np.nan))
+        others = [sims_new[k] - sims[k] for k in sims
+                  if k != region and np.isfinite(sims[k]) and np.isfinite(sims_new[k])]
+        worst_other = max(others) if others else 0.0
+        improved = bool(np.isfinite(delta) and delta > 0.01 and worst_other < 0.02)
         report["rounds"].append({
             "round": r + 1, "region": region, "depth": depth,
             "added": int(len(new)),
@@ -360,6 +391,10 @@ def evolve(B, ids, ui, sp, geo: Geometry, rounds: int = 3, grow_frac: float = 0.
                   f"{'保留' if improved else '回滚'}")
         if improved:
             sims = sims_new
+            if r + 1 < rounds:
+                # 下轮要用新的活动矩阵（这一轮加了神经元）
+                acts_all = np.vstack([observe(B, ui, probes, steps),
+                                      observe(B, ui, rand, steps)])
         else:
             B, ids, ui = snapB, snapIds, Interface(snapB, snapIds, sp)
             break
