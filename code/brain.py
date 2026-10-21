@@ -185,6 +185,22 @@ class Brain:
         self.group = np.r_[self.group, np.full(len(S), group, dtype=np.int16)]
         return W
 
+    def add_edges(self, sources, targets, weights, group: int = 0) -> None:
+        """显式加一批边（来源/目标/权重一一对应）；结构可塑性复制父神经元输入时用它。"""
+        S = np.asarray(sources, dtype=np.int32).ravel()
+        D = np.asarray(targets, dtype=np.int32).ravel()
+        W = np.asarray(weights, dtype=np.float32).ravel()
+        if not (len(S) == len(D) == len(W)):
+            raise ValueError(f"add_edges 长度不一致：{len(S)}/{len(D)}/{len(W)}")
+        if len(S) == 0:
+            return
+        sgn = np.where([self.is_inh[int(i)] for i in S], -1.0, 1.0).astype(np.float32)
+        self.src = np.r_[self.src, S]
+        self.dst = np.r_[self.dst, D]
+        self.w = np.r_[self.w, W]
+        self.sgn = np.r_[self.sgn, sgn]
+        self.group = np.r_[self.group, np.full(len(S), group, dtype=np.int16)]
+
     def chain(self, relays, w_range=(0.35, 0.45), group: int = 0,
               thr_frac: float = 0.55, soft_frac: float = 0.45):
         """一条链：顺次相接（每隔一小段一个神经元，前一个 → 后一个）。"""

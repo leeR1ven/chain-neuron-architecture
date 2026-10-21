@@ -12,7 +12,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from brain import Config  # noqa: E402
-from build import Spec, Interface, build  # noqa: E402
+from build import GROUP_PFC_FWD, Spec, Interface, build  # noqa: E402
 from calib import ref_calibrate  # noqa: E402
 import structure as S  # noqa: E402
 
@@ -86,7 +86,27 @@ def main() -> int:
     check("新线仍是一对一", len(new_wires) > 0 and bool(np.all(
         np.bincount(B.dst, minlength=B.n)[new_wires] == 1)))
 
-    # 4) 回程：少量前额叶打不开、一大片能打开
+    # 3b) 按立体网络规则加在**前额叶**（链里的"最后一层"）：5% 父单元 × 2 子单元 × 2 输入
+    gkey = ("audio", 4)
+    n_g0 = len(ids["pfc_groups"][gkey])
+    newp = S.grow_pfc(B, ids, acts_all, sp, geo, "audio", 4, fraction=0.05)
+    din2 = np.bincount(B.dst, minlength=B.n)
+    check("加前额叶神经元生效",
+          len(newp) > 0 and len(ids["pfc_groups"][gkey]) == n_g0 + len(newp),
+          f"{n_g0} -> {len(ids['pfc_groups'][gkey])}")
+    check("新前额叶神经元各 2 条输入", bool(np.all(din2[newp] == 2)),
+          din2[newp].tolist())
+    check("前额叶索引已重建", bool(np.isin(newp, ids["other_pfc"]).all()))
+
+    # 4) 回程：边数 ≤ 前向一半；少量前额叶打不开、一大片能打开；不落回第 1 层
+    fwd = int((B.group == GROUP_PFC_FWD).sum())
+    ret_e = int(np.isin(B.group, [16, 17, 18, 19]).sum())
+    check("回程边 ≤ 前向一半", ret_e <= 0.5 * fwd, f"{ret_e}/{fwd}")
+    l1 = ids["layers"][("audio", 1)]
+    r_l1 = np.r_[B.ids_of("ret_audio_L1_0"), B.ids_of("ret_audio_L1_1")]
+    check("回程不落回第 1 层",
+          int((np.isin(B.dst, l1) & np.isin(B.src, r_l1)).sum()) == 0)
+
     g = ids["pfc_groups"][("audio", 4)]
     g = g[B.alive[g]]
     ret = np.array([i for i in range(B.n) if B.region[i].startswith("ret_audio_L4_0")])

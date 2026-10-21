@@ -237,32 +237,38 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
                       axes=(1, 2), thr_frac=f, soft_frac=gg, group=GROUP_PFC_FWD,
                       exact=(sp.pick_mode == "exact"))
             # ---- 回程：去程的原路反向（前额叶组 → 返回中继 → 回到这一层按位置最近的神经元）
-            # 门槛 = 自己的阈值 + 抑制神经元（两者一起起作用）
-            gsz = len(g)
-            rg = B.add(f"rt_inh_{name}_L{li}", np.array(
-                [[geo.x_pfc - 0.03, (y0 + y1) / 2, 0.5]], np.float32),
-                thr=0.30, soft=0.20, inh=True)
-            # 抑制细胞收这一片前额叶的信号（一大片），压住返回中继
-            B.connect(rg, g, k=min(gsz, 256), w_range=(0.004, 0.008), axes=(1, 2),
-                      thr_frac=0.02, soft_frac=0.05, group=16)
-            prevr = g
-            for hj, frac in enumerate((2 / 3, 1 / 3)):
-                rc = max(2, int(round(gsz * (0.5 - 0.2 * hj))))
-                yh = np.linspace(y0, y1, rc)
-                zh = np.linspace(0.10, 0.90, rc)
-                xh = geo.x_in + 0.10 + (geo.x_pfc - geo.x_in - 0.10) * frac
-                rp = np.stack([np.full(rc, xh), yh, zh], axis=1).astype(np.float32)
-                r = B.add(f"ret_{name}_L{li}_{hj}", rp, thr=0.30, soft=0.35)
-                # 返回中继接**一大片**前额叶（多对一，汇合）；以及抑制细胞压住它
-                B.connect(r, prevr, k=min(len(prevr), 48), w_range=(0.05, 0.12),
-                          axes=(1, 2), thr_frac=0.35, soft_frac=0.40, group=17)
-                # 抑制细胞只压第一级回程中继：第二级如果再被压一次，回程永远传不回去
-                if hj == 0:
-                    B.connect(r, rg, k=1, w_range=(0.55, 0.65), axes=(1, 2), group=18)
-                if hj == 1 and li > 1:   # 第1层是外界直接驱动的传感器，回程不能落回那里      # 最后一级送回**原来那一层**，位置对位置
-                    B.connect(lay, r, k=2, w_range=(0.06, 0.16), axes=(1, 2),
-                              thr_frac=0.25, soft_frac=0.45, group=19)
-                prevr = r
+            # 第 1 层是外界直接驱动的传感器，**不建回程**（落回去会锁死）。
+            if li > 1:
+                gsz = len(g)
+                rg = B.add(f"rt_inh_{name}_L{li}", np.array(
+                    [[geo.x_pfc - 0.03, (y0 + y1) / 2, 0.5]], np.float32),
+                    thr=0.30, soft=0.20, inh=True)
+                # 抑制细胞只收一小片前额叶（24 条随机铺开），压住第一级回程中继；
+                # 权重小，只够当"门槛的一部分"，不能把回程直接压死
+                B.connect(rg, g, k=min(gsz, 12), w_range=(0.010, 0.020), axes=(1, 2),
+                          thr_frac=0.02, soft_frac=0.05, group=16, nearest=False)
+                prevr = g
+                for hj, frac in enumerate((2 / 3, 1 / 3)):
+                    # 回程中继要少：它们是调制，不是第二条前向通路（边数按"≤前向一半"卡）
+                    rc = max(2, min(int(round(gsz * (0.20 - 0.08 * hj))), 16))
+                    yh = np.linspace(y0, y1, rc)
+                    zh = np.linspace(0.10, 0.90, rc)
+                    xh = geo.x_in + 0.10 + (geo.x_pfc - geo.x_in - 0.10) * frac
+                    rp = np.stack([np.full(rc, xh), yh, zh], axis=1).astype(np.float32)
+                    r = B.add(f"ret_{name}_L{li}_{hj}", rp, thr=0.30, soft=0.35)
+                    # 第一级只看 6 条**铺开**的前额叶、第二级只看 4 条上一级：
+                    # 必须"这一片里很多条同时亮"才开（随机铺开才叫"一大片"；只取最近会变成看局部小簇）
+                    B.connect(r, prevr, k=(6 if hj == 0 else 4),
+                              w_range=(0.05, 0.12), axes=(1, 2),
+                              thr_frac=0.45, soft_frac=0.40, group=17, nearest=False)
+                    if hj == 0:
+                        B.connect(r, rg, k=1, w_range=(0.15, 0.25), axes=(1, 2), group=18)
+                    else:
+                        # 最后一级送回**原来那一层**，位置对位置（每个层神经元只收 2 条回程边）；
+                        # 权重要够到"接近门槛"的神经元，才算调制（太小等于没有回程）
+                        B.connect(lay, r, k=2, w_range=(0.30, 0.45), axes=(1, 2),
+                                  thr_frac=0.25, soft_frac=0.45, group=19)
+                    prevr = r
             groups.append(g)
             ids[f"pfc_{name}_L{li}"] = g
         pfc_by_area[name] = np.concatenate(groups)
@@ -367,9 +373,10 @@ def build(sp: Spec | None = None, cfg: Config | None = None,
             B.counted[i] = False
     # ---- 统一按深度定门槛（最后一手，保证生效；比例按实测驱动量级取）----
     _DEPTH = DEPTH_GAIN
-    # 只统计**前向边**的权重和（来源不是 ret_ 的边）：
-    # 回程边不该把门槛顶上去，否则门槛虚高、神经元永远够不着
-    _fwd = np.array([not B.region[int(x)].startswith("ret_") for x in B.src])
+    # 只统计**前向、且非抑制**的入边权重和：
+    # 回程边不该把门槛顶上去；抑制边是减法的，按正数算会把门槛虚高
+    _fwd = np.array([not B.region[int(x)].startswith("ret_") and not B.is_inh[int(x)]
+                     for x in B.src])
     _sw = np.bincount(B.dst[_fwd], weights=B.w[_fwd], minlength=B.n)
     _deg = np.bincount(B.dst[_fwd], minlength=B.n)      # 每个神经元实际有几条前向入边
     _thr = np.asarray(B.thr, dtype=np.float64).copy()
